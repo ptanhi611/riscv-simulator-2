@@ -10,6 +10,7 @@
 #include "globals.h"
 #include "common/instructions.h"
 #include "config.h"
+#include "include/pipelining_register.h"
 
 #include <cctype>
 #include <cstdint>
@@ -28,11 +29,29 @@ using instruction_set::get_instr_encoding;
 
 
 RVSSVM::RVSSVM() : VmBase() {
+
+  private:
+    IF_ID_registers IF_ID_registers;
+    ID_EX_registers id_ex_reg;
+    EX_MEM_registers ex_mem;
+    MEM_WB_registers mem_wb_reg;
+  
+
+
   DumpRegisters(globals::registers_dump_file_path, registers_);
   DumpState(globals::vm_state_dump_file_path);
 }
 
 RVSSVM::~RVSSVM() = default;
+
+
+void RVSSVM::Clocktick(){
+  DoFetch();
+  DoDecode();
+  DoExecute();
+  DoMemory();
+  write_back();
+}
 
 void RVSSVM::Fetch() {
   current_instruction_ = memory_controller_.ReadWord(program_counter_);
