@@ -35,6 +35,12 @@ struct VmConfig {
 
   uint64_t instruction_execution_limit = 100;
 
+  int pipeline_mode = 0;
+
+  int getPipelineMode() const {
+    return pipeline_mode;
+  }
+
   bool m_extension_enabled = true;
   bool f_extension_enabled = true;
   bool d_extension_enabled = true;
@@ -185,6 +191,18 @@ struct VmConfig {
           throw std::invalid_argument("Unknown value: " + value);
         }
       }
+    }
+    else if(section=="pipelining"){
+      if (key == "mode") {
+            int mode = std::stoi(value);
+            if (mode >= 0 && mode <= 5) { 
+                pipeline_mode = mode;
+            } else {
+                throw std::invalid_argument("Invalid pipeline mode value: " + value);
+            }
+        } else {
+            throw std::invalid_argument("Unknown key in pipelining section: " + key);
+        }
     }
     else {
       throw std::invalid_argument("Unknown section: " + section);

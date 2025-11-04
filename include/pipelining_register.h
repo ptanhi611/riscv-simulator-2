@@ -21,7 +21,11 @@ struct IF_ID_registers{
     uint64_t pc = 0;
     uint64_t pc_plus_4 = 0;
     uint32_t inst = 0;
+
+    
     bool stall = false;
+
+    
 };
 
 
@@ -34,6 +38,8 @@ struct ID_EX_registers{
 
     int64_t imm = 0;
 
+    uint32_t instruction_bits;
+
     uint8_t rs1 = 0;
     uint8_t rs2 = 0;
     uint8_t rd = 0;
@@ -41,6 +47,9 @@ struct ID_EX_registers{
     bool stall = false;
 
     Control_signals signals;
+
+    uint8_t funct3;
+    uint8_t funct7;
 };
 
 
@@ -55,6 +64,9 @@ struct EX_MEM_registers{
     bool stall = false;
 
     Control_signals signals;
+
+    uint8_t funct3;
+    
 
 };
 
