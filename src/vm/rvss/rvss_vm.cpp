@@ -10,7 +10,8 @@
 #include "globals.h"
 #include "common/instructions.h"
 #include "config.h"
-
+#include "vm/alu.h" 
+#include "vm/registers.h" 
 
 #include <cctype>
 #include <cstdint>
@@ -23,24 +24,26 @@
 #include <condition_variable>
 #include <queue>
 #include <atomic>
+#include <cstring> 
+#include <limits> 
+#include <iomanip> 
 
 using instruction_set::Instruction;
 using instruction_set::get_instr_encoding;
 
-
+// Constructor: Initialize modes and registers
 RVSSVM::RVSSVM() : VmBase() {
+  // Read mode from config
+  int mode_from_config = vm_config::config.getPipelineMode();
+  pipeline_mode = static_cast<MODES>(mode_from_config);
   
-  pipeline_mode = MODES::PIPELINE_NO_HAZARD;
   pipeline_stalled_ = false;
+  stall_count = 0;
 
-
-  id_ex_reg ={};
+  id_ex_reg = {};
   if_id_registers = {};
   ex_mem = {};
   mem_wb_reg = {};
-
-  
-
 
   DumpRegisters(globals::registers_dump_file_path, registers_);
   DumpState(globals::vm_state_dump_file_path);
@@ -50,8 +53,7 @@ RVSSVM::~RVSSVM() = default;
 
 
 void RVSSVM::Clocktick(){
-
-  std::cout << "--- CYCLE " << std::dec << cycle_s_+1 << " START --- PC: 0x" << std::hex << program_counter_ << std::endl;
+  std::cout << "--- CYCLE " << std::dec << cycle_s_ + 1 << " START --- PC: 0x" << std::hex << program_counter_ << std::endl;
 
   pipeline_write_back();
   pipeline_mem();
@@ -62,37 +64,74 @@ void RVSSVM::Clocktick(){
 }
 
 
+
 void RVSSVM::Pipeline_fetch() {
-  
+  // 1. Obey the HDU's stall signal
+  if (pipeline_stalled_) {
+    pipeline_stalled_ = false;  // Reset for next cycle
+    if_id_registers.valid = false; // Inject NOP ("bubble")
+    std::cout << "[FETCH] STALLED" << std::endl;
+    return; // Do NOT fetch, do NOT advance PC
+  }
+
   std::cout << "[FETCH] PC: 0x" << std::hex << program_counter_ << std::dec << std::endl;
 
   uint64_t current_pc = program_counter_;
   uint64_t next_pc = program_counter_ + 4;
 
   try {
-    // Read from memory and write to IF/ID register
     if_id_registers.inst = memory_controller_.ReadWord(current_pc);
     if_id_registers.pc = current_pc;
     if_id_registers.pc_plus_4 = next_pc;
-    // if_id_reg_.valid = true; // Add a 'valid' bool to your struct if you can
+    if_id_registers.valid = true; // Mark as stall instruction
   } catch (const std::runtime_error& e) {
     if_id_registers.inst = 0; // Inject NOP on memory fail
-    // if_id_reg_.valid = false;
+    if_id_registers.valid = false;
   }
   
-  // Update the PC for the *next* fetch cycle
   program_counter_ = next_pc;
 }
 
 
 void RVSSVM::pipeline_decode() {
-  // Get instruction from the previous stage
-  const uint32_t instruction = if_id_registers.inst;
+  // 1. Get the current mode
+  int mode = static_cast<int>(pipeline_mode);
+  
+  // 2. Ask the HDU (the member variable) what to do
+  PipelineControlSignals signals = HDU.compute_signals(
+      mode,
+      if_id_registers.inst, // Pass the new instruction
+      id_ex_reg,      // Pass the state of the EX stage
+      ex_mem,     // Pass the state of the MEM stage
+      mem_wb_reg     // Pass the state of the WB stage
+  );
 
-  // --- Logic from your old Decode() ---
+  // 3. React to HDU signals
+  if (signals.stall_fetch) {
+      pipeline_stalled_ = true; // Tell Fetch to freeze next cycle
+      stall_count++; // Increment stall counter
+  }
+  if (signals.flush_decode) {
+      std::cout << "[DECODE] FLUSHED by HDU" << std::endl;
+      id_ex_reg = {}; // Inject NOP
+      id_ex_reg.valid = false;
+      return;
+  }
+
+  // 4. If incoming instruction is a bubble, pass it
+  if (!if_id_registers.valid) {
+      std::cout << "[DECODE] Bubble passing through" << std::endl;
+      id_ex_reg = {};
+      id_ex_reg.valid = false;
+      return;
+  }
+
+  // 5. No stall: Proceed with normal decode
+  const uint32_t instruction = if_id_registers.inst;
+  std::cout << "[DECODE] OK. Decoding 0x" << std::hex << instruction << std::dec << std::endl;
+  
   control_unit_.SetControlSignals(instruction);
 
-  // --- Logic from the first part of your old Execute() ---
   uint8_t rs1 = (instruction >> 15) & 0b11111;
   uint8_t rs2 = (instruction >> 20) & 0b11111;
   uint8_t rd = (instruction >> 7) & 0b11111;
@@ -100,89 +139,119 @@ void RVSSVM::pipeline_decode() {
   uint8_t funct7 = (instruction >> 25) & 0b1111111;
   int32_t imm = ImmGenerator(instruction);
 
-
-  std::cout << "[DECODE] INSTRUCTION: 0x" << std::hex << if_id_registers.inst << std::dec << std::endl;
-
-
   uint64_t reg1_value = registers_.ReadGpr(rs1);
   uint64_t reg2_value = registers_.ReadGpr(rs2);
 
-  // --- Fill the ID/EX register for the next stage ---
+  // 6. Fill the ID/EX register
   id_ex_reg.pc_plus_4 = if_id_registers.pc_plus_4;
   id_ex_reg.rs1_data = reg1_value;
-  id_ex_reg.rs_2_data = reg2_value; // Your struct has this name
+  id_ex_reg.rs_2_data = reg2_value;
   id_ex_reg.imm = imm;
   id_ex_reg.rs1 = rs1;
   id_ex_reg.rs2 = rs2;
   id_ex_reg.rd = rd;
-  id_ex_reg.funct3 = funct3; // Pass funct3
-  id_ex_reg.funct7 = funct7; // Pass funct7
+  id_ex_reg.funct3 = funct3; 
+  id_ex_reg.funct7 = funct7; 
+  id_ex_reg.instruction_bits = instruction;
 
-  // Copy all control signals
+  // Pass control signals from Control Unit
   id_ex_reg.signals.alu_op = control_unit_.GetAluOp();
   id_ex_reg.signals.alu_src_ = control_unit_.GetAluSrc();
   id_ex_reg.signals.mem_read_ = control_unit_.GetMemRead();
   id_ex_reg.signals.mem_write_ = control_unit_.GetMemWrite();
   id_ex_reg.signals.reg_write_ = control_unit_.GetRegWrite();
   id_ex_reg.signals.mem_to_reg = control_unit_.GetMemToReg();
-  id_ex_reg.instruction_bits = instruction;
-  // id_ex_reg_.signals.branch = control_unit_.GetBranch(); // Add 'branch' to your Control_signals struct
+  // id_ex_reg_.signals.branch = control_unit_.GetBranch(); 
+
+  // Pass forwarding signals from HDU
+  id_ex_reg.forward_A = signals.forward_A;
+  id_ex_reg.forward_B = signals.forward_B;
+  id_ex_reg.valid = true;
 }
-
-
-
 
 
 void RVSSVM::pipeline_execute() {
-  // 1. Get all data from the ID/EX register
-  uint64_t reg1_value = id_ex_reg.rs1_data;
-  uint64_t reg2_value = id_ex_reg.rs_2_data;
-  uint32_t instruction = id_ex_reg.instruction_bits; // <-- This is the fix
+  // 1. Pass bubble if install
+  if (!id_ex_reg.valid) {
+    std::cout << "[EXECUTE] Bubble" << std::endl;
+    ex_mem = {};
+    ex_mem.valid = false;
+    return;
+  }
 
-  // 2. ALU logic from your old Execute()
+  // 2. Select data for rs1 based on Forwarding (MUX A)
+  uint64_t reg1_value;
+  switch (id_ex_reg.forward_A) {
+      case ForwardSource::FROM_DECODE:
+          reg1_value = id_ex_reg.rs1_data;
+          break;
+      case ForwardSource::FROM_EXECUTE:
+          reg1_value = ex_mem.alu_ans;
+          std::cout << "[EXECUTE] Forwarding EX->EX for rs1" << std::endl;
+          break;
+      case ForwardSource::FROM_MEMORY:
+          reg1_value = mem_wb_reg.signals.mem_to_reg ? mem_wb_reg.mem_data : mem_wb_reg.alu_ans;
+          std::cout << "[EXECUTE] Forwarding MEM->EX for rs1" << std::endl;
+          break;
+  }
+  
+  // 3. Select data for rs2 based on Forwarding (MUX B)
+  uint64_t reg2_value;
+  switch (id_ex_reg.forward_B) {
+      case ForwardSource::FROM_DECODE:
+          reg2_value = id_ex_reg.rs_2_data;
+          break;
+      case ForwardSource::FROM_EXECUTE:
+          reg2_value = ex_mem.alu_ans;
+          std::cout << "[EXECUTE] Forwarding EX->EX for rs2" << std::endl;
+          break;
+      case ForwardSource::FROM_MEMORY:
+          reg2_value = mem_wb_reg.signals.mem_to_reg ? mem_wb_reg.mem_data : mem_wb_reg.alu_ans;
+          std::cout << "[EXECUTE] Forwarding MEM->EX for rs2" << std::endl;
+          break;
+  }
+  
+  // 4. Handle ALU source MUX (for immediates)
   if (id_ex_reg.signals.alu_src_) {
     reg2_value = static_cast<uint64_t>(id_ex_reg.imm);
   }
-
-  // 3. For Mode 2, we only run the ALU logic.
-  // We skip branches, floats, and syscalls.
+  
+  // --- (Skipping Float/CSR/Branch logic for now) ---
+  // (Your old logic from Execute() for floats, etc. is NOT here)
+  
   uint64_t alu_result;
   bool overflow;
-  
-  // This now uses the *correct* instruction bits
-  alu::AluOp aluOperation = control_unit_.GetAluSignal(instruction, id_ex_reg.signals.alu_op);
+  alu::AluOp aluOperation = control_unit_.GetAluSignal(id_ex_reg.instruction_bits, id_ex_reg.signals.alu_op);
   std::tie(alu_result, overflow) = alu_.execute(aluOperation, reg1_value, reg2_value);
 
-  // 4. Fill the EX/MEM register for the next stage
+  std::cout << "[EXECUTE] OK. Result: 0x" << std::hex << alu_result << std::dec
+            << " (for reg x" << (int)id_ex_reg.rd << ")" << std::endl;
+
+  // 5. Fill EX/MEM register
   ex_mem.alu_ans = alu_result;
-  ex_mem.data = id_ex_reg.rs_2_data; // Pass rs2 data for stores
-  ex_mem.des_address = id_ex_reg.rd;   // Pass rd
-  ex_mem.funct3 = id_ex_reg.funct3;    // Pass funct3 for mem stage
-  ex_mem.signals = id_ex_reg.signals;  // Pass control signals
-
-
-  std::cout << "[EXECUTE] ALU_OP: " << (int)id_ex_reg.signals.alu_op
-            << ", rs1_data: " << (int)id_ex_reg.rs1_data
-            << ", rs2/imm: " << (int)(id_ex_reg.signals.alu_src_ ? id_ex_reg.imm : id_ex_reg.rs_2_data)
-            << std::endl;
+  ex_mem.data = id_ex_reg.rs_2_data; // Pass original rs2 data for stores
+  ex_mem.des_address = id_ex_reg.rd; 
+  ex_mem.funct3 = id_ex_reg.funct3; 
+  ex_mem.signals = id_ex_reg.signals; 
+  ex_mem.valid = true;
 }
 
 
-
-
-
-
-
 void RVSSVM::pipeline_mem() {
-  // Get data from the previous stage
-  uint64_t addr = ex_mem.alu_ans; // Address is the ALU result
+  if (!ex_mem.valid) {
+    std::cout << "[MEMORY] Bubble" << std::endl;
+    mem_wb_reg = {};
+    mem_wb_reg.valid = false;
+    return;
+  }
+  
+  uint64_t addr = ex_mem.alu_ans; 
   uint8_t funct3 = ex_mem.funct3;
   uint64_t store_data = ex_mem.data;
-  
-  uint64_t mem_read_data = 0; // Data read from memory (for loads)
+  uint64_t mem_read_data = 0; 
 
-  // --- Logic from your old WriteMemory() (integer part) ---
   if (ex_mem.signals.mem_read_) {
+    std::cout << "[MEMORY] OK. Reading from 0x" << std::hex << addr << std::dec << std::endl;
     switch (funct3) {
       case 0b000: mem_read_data = static_cast<int8_t>(memory_controller_.ReadByte(addr)); break;
       case 0b001: mem_read_data = static_cast<int16_t>(memory_controller_.ReadHalfWord(addr)); break;
@@ -191,80 +260,62 @@ void RVSSVM::pipeline_mem() {
       case 0b100: mem_read_data = static_cast<uint8_t>(memory_controller_.ReadByte(addr)); break;
       case 0b101: mem_read_data = static_cast<uint16_t>(memory_controller_.ReadHalfWord(addr)); break;
       case 0b110: mem_read_data = static_cast<uint32_t>(memory_controller_.ReadWord(addr)); break;
+      default: mem_read_data = memory_controller_.ReadDoubleWord(addr);
     }
   } else if (ex_mem.signals.mem_write_) {
+    std::cout << "[MEMORY] OK. Writing 0x" << std::hex << store_data << " to 0x" << addr << std::dec << std::endl;
     switch (funct3) {
       case 0b000: memory_controller_.WriteByte(addr, store_data & 0xFF); break;
       case 0b001: memory_controller_.WriteHalfWord(addr, store_data & 0xFFFF); break;
       case 0b010: memory_controller_.WriteWord(addr, store_data & 0xFFFFFFFF); break;
       case 0b011: memory_controller_.WriteDoubleWord(addr, store_data); break;
     }
+  } else {
+    std::cout << "[MEMORY] OK. (No-op)" << std::endl;
   }
-
-  // --- Fill the MEM/WB register for the next stage ---
-  mem_wb_reg.alu_ans = ex_mem.alu_ans;   // Pass ALU result
-  mem_wb_reg.mem_data = mem_read_data;      // Pass data from memory
-  mem_wb_reg.des_address = ex_mem.des_address; // Pass rd
-  mem_wb_reg.signals = ex_mem.signals; // Pass control signals
-
-
-
-  std::cout << "[MEMORY] ALU_RESULT: 0x" << std::hex << ex_mem.alu_ans << std::dec
-            << ", MemRead: " << ex_mem.signals.mem_read_
-            << ", MemWrite: " << ex_mem.signals.mem_write_
-            << std::endl;
+  
+  mem_wb_reg.alu_ans = ex_mem.alu_ans;
+  mem_wb_reg.mem_data = mem_read_data; 
+  mem_wb_reg.des_address = ex_mem.des_address;
+  mem_wb_reg.signals = ex_mem.signals;
+  mem_wb_reg.valid = true;
 }
-
-
-
-
-
 
 void RVSSVM::pipeline_write_back() {
-  // Get data from the previous stage
-
-
-
-  std::cout << "[WRITE_BACK] RD: x" << (int)mem_wb_reg.des_address
-            << ", RegWrite: " << mem_wb_reg.signals.reg_write_
-            << ", MemToReg: " << mem_wb_reg.signals.mem_to_reg
-            << ", ALU_ANS: 0x" << std::hex << mem_wb_reg.alu_ans << std::dec
-            << ", MEM_DATA: 0x" << std::hex << mem_wb_reg.mem_data << std::dec
-            << std::endl;
-
-
-
-
-  if (!mem_wb_reg.signals.reg_write_) {
-    return; // Do nothing
+  if (!mem_wb_reg.valid) {
+    std::cout << "[WRITE_BACK] Bubble" << std::endl;
+    return; // Bubble is done
   }
 
-  // --- Logic from your old WriteBack() (integer part) ---
-  uint64_t data_to_write;
-  uint8_t rd = mem_wb_reg.des_address;
+  if (mem_wb_reg.signals.reg_write_) {
+    uint64_t data_to_write;
+    uint8_t rd = mem_wb_reg.des_address;
 
-  if (mem_wb_reg.signals.mem_to_reg) {
-    // It was a Load (data came from memory)
-    data_to_write = mem_wb_reg.mem_data;
+    if (mem_wb_reg.signals.mem_to_reg) {
+      data_to_write = mem_wb_reg.mem_data;
+    } else {
+      data_to_write = mem_wb_reg.alu_ans;
+    }
+    
+    if (rd != 0) {
+      std::cout << "[WRITE_BACK] OK. Writing 0x" << std::hex << data_to_write << " to x" << std::dec << (int)rd << std::endl;
+      registers_.WriteGpr(rd, data_to_write);
+    } else {
+      std::cout << "[WRITE_BACK] OK. (No-op, dest is x0)" << std::endl;
+    }
+    
+    instructions_retired_++;
   } else {
-    // It was an ALU op (data came from ALU result)
-    data_to_write = mem_wb_reg.alu_ans;
+    std::cout << "[WRITE_BACK] OK. (No-op, RegWrite=0)" << std::endl;
   }
-  
-  // (We skip JAL/LUI logic for now, as that's in WriteBack's switch)
-  
-  if (rd != 0) {
-    registers_.WriteGpr(rd, data_to_write);
-  }
-  
-  instructions_retired_++; // Increment *here* when an instruction finishes
 }
 
-void RVSSVM::Fetch() {
+// --- Your Original Single-Cycle Functions ---
+// (These are all UNCHANGED)
 
+void RVSSVM::Fetch() {
   current_instruction_ = memory_controller_.ReadWord(program_counter_);
   UpdateProgramCounter(4);
-
 }
 
 void RVSSVM::Decode() {
@@ -353,11 +404,7 @@ void RVSSVM::Execute() {
           break;
         }
       }
-
     }
-
-
-
   }
 
   
@@ -405,9 +452,6 @@ void RVSSVM::ExecuteFloat() {
   alu::AluOp aluOperation = control_unit_.GetAluSignal(current_instruction_, control_unit_.GetAluOp());
   std::tie(execution_result_, fcsr_status) = alu::Alu::fpexecute(aluOperation, reg1_value, reg2_value, reg3_value, rm);
 
-  // std::cout << "+++++ Float execution result: " << execution_result_ << std::endl;
-
-
   registers_.WriteCsr(0x003, fcsr_status);
 }
 
@@ -451,7 +495,6 @@ void RVSSVM::ExecuteCsr() {
   csr_uimm_ = rs1;
 }
 
-// TODO: implement writeback for syscalls
 void RVSSVM::HandleSyscall() {
   uint64_t syscall_number = registers_.ReadGpr(17);
   switch (syscall_number) {
@@ -679,9 +722,6 @@ void RVSSVM::WriteMemory() {
   std::vector<uint8_t> old_bytes_vec;
   std::vector<uint8_t> new_bytes_vec;
 
-  // TODO: use direct read to read memory for undo/redo functionality, i.e. ReadByte -> ReadByte_d
-
-
   if (control_unit_.GetMemWrite()) {
     switch (funct3) {
       case 0b000: {// SB
@@ -743,8 +783,6 @@ void RVSSVM::WriteMemoryFloat() {
     memory_result_ = memory_controller_.ReadWord(execution_result_);
   }
 
-  // std::cout << "+++++ Memory result: " << memory_result_ << std::endl;
-
   uint64_t addr = 0;
   std::vector<uint8_t> old_bytes_vec;
   std::vector<uint8_t> new_bytes_vec;
@@ -756,7 +794,6 @@ void RVSSVM::WriteMemoryFloat() {
     }
     uint32_t val = registers_.ReadFpr(rs2) & 0xFFFFFFFF;
     memory_controller_.WriteWord(execution_result_, val);
-    // new_bytes_vec.push_back(memory_controller_.ReadByte(addr));
     for (size_t i = 0; i < 4; ++i) {
       new_bytes_vec.push_back(memory_controller_.ReadByte(addr + i));
     }
@@ -858,7 +895,6 @@ void RVSSVM::WriteBack() {
   if (old_reg!=new_reg) {
     current_delta_.register_changes.push_back({reg_index, reg_type, old_reg, new_reg});
   }
-
 }
 
 void RVSSVM::WriteBackFloat() {
@@ -906,29 +942,6 @@ void RVSSVM::WriteBackFloat() {
         }
       }
     }
-
-    // // write to GPR
-    // if (funct7==0b1010000
-    //     || funct7==0b1100000
-    //     || funct7==0b1110000) { // f(eq|lt|le).s, fcvt.(w|wu|l|lu).s
-    //   old_reg = registers_.ReadGpr(rd);
-    //   registers_.WriteGpr(rd, execution_result_);
-    //   new_reg = execution_result_;
-    //   reg_type = 0; // GPR
-
-    // }
-    // // write to FPR
-    // else if (opcode==get_instr_encoding(Instruction::kflw).opcode) {
-    //   old_reg = registers_.ReadFpr(rd);
-    //   registers_.WriteFpr(rd, memory_result_);
-    //   new_reg = memory_result_;
-    //   reg_type = 2; // FPR
-    // } else {
-    //   old_reg = registers_.ReadFpr(rd);
-    //   registers_.WriteFpr(rd, execution_result_);
-    //   new_reg = execution_result_;
-    //   reg_type = 2; // FPR
-    // }
   }
 
   if (old_reg!=new_reg) {
@@ -1021,11 +1034,13 @@ void RVSSVM::WriteBackCsr() {
       break;
     }
   }
-
 }
+
+
 void RVSSVM::Run_single(){
     ClearStop();
     uint64_t instruction_executed = 0;
+    running_ = true; 
 
     while (!stop_requested_ && program_counter_ < program_size_) {
       if (instruction_executed > vm_config::config.getInstructionExecutionLimit())
@@ -1039,8 +1054,8 @@ void RVSSVM::Run_single(){
       instructions_retired_++;
       instruction_executed++;
       cycle_s_++;
-      std::cout << "Program Counter: " << program_counter_ << std::endl;
     }
+    running_ = false; 
     if (program_counter_ >= program_size_) {
       std::cout << "VM_PROGRAM_END" << std::endl;
       output_status_ = "VM_PROGRAM_END";
@@ -1051,59 +1066,42 @@ void RVSSVM::Run_single(){
 
 
 void RVSSVM::Run() {
-
   int get_mode = vm_config::config.getPipelineMode();
   pipeline_mode = static_cast<MODES>(get_mode);
-
+  
+  std::cout << "--- Starting VM Run ---" << std::endl;
   if (pipeline_mode == MODES::SINGLE_CYLCE) {
+    std::cout << "Mode 0: SINGLE_CYLCE" << std::endl;
     Run_single();
   } else {
+    if(pipeline_mode == MODES::PIPELINE_NO_HAZARD) std::cout << "Mode 1: PIPELINE_NO_HAZARD (Expect wrong results for hazards)" << std::endl;
+    else if(pipeline_mode == MODES::PIPELINE_HAZARD) std::cout << "Mode 2: PIPELINE_HAZARD (Stall-Only)" << std::endl;
+    else if(pipeline_mode == MODES::PIPELINE_HAZARD_FORWARDING) std::cout << "Mode 3: PIPELINE_HAZARD_FORWARDING" << std::endl;
+    
     Run_Pipelined();
   }
 }
 
 void RVSSVM::DebugRun() {
-
-  if (pipeline_mode!= MODES::SINGLE_CYLCE) {
+  int get_mode = vm_config::config.getPipelineMode();
+  pipeline_mode = static_cast<MODES>(get_mode);
+    
+  if (pipeline_mode != MODES::SINGLE_CYLCE) {
     std::cout << "DebugRun is only supported in Single-Cycle mode." << std::endl;
     return;
   }
-
-
+  
   ClearStop();
   uint64_t instruction_executed = 0;
+  running_ = true; 
   while (!stop_requested_ && program_counter_ < program_size_) {
     if (instruction_executed > vm_config::config.getInstructionExecutionLimit())
       break;
-    current_delta_.old_pc = program_counter_;
+    
     if (std::find(breakpoints_.begin(), breakpoints_.end(), program_counter_) == breakpoints_.end()) {
-      Fetch();
-      Decode();
-      Execute();
-      WriteMemory();
-      WriteBack();
-      instructions_retired_++;
-      instruction_executed++;
-      cycle_s_++;
-      std::cout << "Program Counter: " << program_counter_ << std::endl;
-
-      current_delta_.new_pc = program_counter_;
-      // history_.push(current_delta_);
-      undo_stack_.push(current_delta_);
-      while (!redo_stack_.empty()) {
-        redo_stack_.pop();
-      }
-      current_delta_ = StepDelta();
-      if (program_counter_ < program_size_) {
-        std::cout << "VM_STEP_COMPLETED" << std::endl;
-        output_status_ = "VM_STEP_COMPLETED";
-      } else if (program_counter_ >= program_size_) {
-        std::cout << "VM_LAST_INSTRUCTION_STEPPED" << std::endl;
-        output_status_ = "VM_LAST_INSTRUCTION_STEPPED";
-      }
-      DumpRegisters(globals::registers_dump_file_path, registers_);
-      DumpState(globals::vm_state_dump_file_path);
-
+      Step_single(); 
+      instruction_executed++; 
+      
       unsigned int delay_ms = vm_config::config.getRunStepDelay();
       std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
       
@@ -1113,6 +1111,7 @@ void RVSSVM::DebugRun() {
       break;
     }
   }
+  running_ = false; 
   if (program_counter_ >= program_size_) {
     std::cout << "VM_PROGRAM_END" << std::endl;
     output_status_ = "VM_PROGRAM_END";
@@ -1134,8 +1133,6 @@ void RVSSVM::Step_single(){
     std::cout << "Program Counter: " << std::hex << program_counter_ << std::dec << std::endl;
 
     current_delta_.new_pc = program_counter_;
-
-    // history_.push(current_delta_);
 
     undo_stack_.push(current_delta_);
     while (!redo_stack_.empty()) {
@@ -1168,13 +1165,17 @@ void RVSSVM::Step() {
   if (pipeline_mode == MODES::SINGLE_CYLCE) {
     Step_single();
   } else {
-    // Pipelined step is one clock cycle
     if (running_ || stop_requested_) return; 
-    if (program_counter_ < program_size_) {
+
+    // Check if pipeline is *fully* empty before stopping
+    bool pipeline_empty = !if_id_registers.valid && !id_ex_reg.valid && !ex_mem.valid && !mem_wb_reg.valid;
+    
+    if (program_counter_ < program_size_ || !pipeline_empty) {
         Clocktick();
         std::cout << "Clock cycle advanced. Fetch PC: " << std::hex << program_counter_ << std::dec << std::endl;
         output_status_ = "VM_STEP_COMPLETED";
     } else {
+        std::cout << "VM_PROGRAM_END" << std::endl;
         output_status_ = "VM_PROGRAM_END";
     }
     DumpRegisters(globals::registers_dump_file_path, registers_);
@@ -1192,13 +1193,6 @@ void RVSSVM::Undo() {
   StepDelta last = undo_stack_.top();
   undo_stack_.pop();
 
-  // if (!history_.can_undo()) {
-  //     std::cout << "Nothing to undo.\n";
-  //     return;
-  // }
-
-  // StepDelta last = history_.undo();
-
   for (const auto &change : last.register_changes) {
     switch (change.reg_type) {
       case 0: { // GPR
@@ -1213,7 +1207,7 @@ void RVSSVM::Undo() {
         registers_.WriteFpr(change.reg_index, change.old_value);
         break;
       }
-      default:std::cerr << "Invalid register type: " << change.reg_type << std::endl;
+      default:std::cerr << "Install register type: " << change.reg_type << std::endl;
         break;
     }
   }
@@ -1246,13 +1240,6 @@ void RVSSVM::Redo() {
 
   StepDelta next = redo_stack_.top();
   redo_stack_.pop();
-
-  // if (!history_.can_redo()) {
-  //       std::cout << "Nothing to redo.\n";
-  //       return;
-  //   }
-
-  //   StepDelta next = history_.redo();
 
   for (const auto &change : next.register_changes) {
     switch (change.reg_type) {
@@ -1313,6 +1300,14 @@ void RVSSVM::Reset() {
   undo_stack_ = std::stack<StepDelta>();
   redo_stack_ = std::stack<StepDelta>();
 
+
+  stall_count = 0;
+  if_id_registers = {};
+  id_ex_reg = {};
+  ex_mem = {};
+  mem_wb_reg = {};
+  pipeline_stalled_ = false;
+  
 }
 
 void RVSSVM::Run_Pipelined() {
@@ -1320,35 +1315,31 @@ void RVSSVM::Run_Pipelined() {
   running_ = true;
 
   // --- Main fetch loop ---
-  // This loop runs until the last instruction is fetched
-  while (!stop_requested_ && program_counter_ < program_size_) {
+  while (running_ && !stop_requested_ && program_counter_ < program_size_) {
     if (instructions_retired_ > vm_config::config.getInstructionExecutionLimit())
       break;
     Clocktick(); // Runs one full pipeline cycle
   }
 
-  // --- THIS IS THE FIX ---
-  // The loop has ended, but the last 4-5 instructions are still
-  // inside the pipeline. We must run 4 more "flush" cycles
-  // to push them all the way to the Write-Back stage.
+  // --- Pipeline flush loop ---
   int flush_cycles = 4; // k-1 stages
-  while (!stop_requested_ && flush_cycles > 0) {
+  while (running_ && !stop_requested_ && flush_cycles > 0) {
       Clocktick();
       flush_cycles--;
   }
-  // --- END OF FIX ---
 
   running_ = false;
   if (program_counter_ >= program_size_ && !stop_requested_) {
     std::cout << "VM_PROGRAM_END" << std::endl;
     output_status_ = "VM_PROGRAM_END";
   }
+  
+  // --- ADDED STATS PRINTING ---
+  std::cout << "--- Pipeline Run Stats ---" << std::endl;
+  std::cout << "Total Cycles: " << std::dec << cycle_s_ << std::endl;
+  std::cout << "Total Stalls: " << std::dec << stall_count << std::endl;
+  // --- END ADD ---
+
   DumpRegisters(globals::registers_dump_file_path, registers_);
   DumpState(globals::vm_state_dump_file_path);
 }
-
-
-
-
-
-

@@ -11,9 +11,17 @@ struct Control_signals{
 
     bool reg_write_ = false;
     bool mem_to_reg = false;
+
+    bool branch = false;
 };
 
 
+
+enum class ForwardSource {
+    FROM_DECODE,
+    FROM_EXECUTE,
+    FROM_MEMORY
+};
 
 
 
@@ -23,7 +31,7 @@ struct IF_ID_registers{
     uint32_t inst = 0;
 
     
-    bool stall = false;
+    bool valid = false;
 
     
 };
@@ -44,12 +52,16 @@ struct ID_EX_registers{
     uint8_t rs2 = 0;
     uint8_t rd = 0;
 
-    bool stall = false;
+    bool valid = false;
 
     Control_signals signals;
 
     uint8_t funct3;
     uint8_t funct7;
+
+
+    ForwardSource forward_A = ForwardSource::FROM_DECODE;
+    ForwardSource forward_B = ForwardSource::FROM_DECODE;
 };
 
 
@@ -61,11 +73,15 @@ struct EX_MEM_registers{
     uint64_t data = 0;
     uint8_t des_address = 0;
 
-    bool stall = false;
+    bool valid = false;
 
     Control_signals signals;
 
     uint8_t funct3;
+
+    ForwardSource forward_A = ForwardSource::FROM_EXECUTE;
+    ForwardSource forward_B = ForwardSource::FROM_EXECUTE;
+
     
 
 };
@@ -80,7 +96,12 @@ struct MEM_WB_registers{
     uint64_t mem_data  = 0;
     uint8_t des_address = 0;
 
-    bool stall = false;
+    bool valid = false;
 
     Control_signals signals;
+
+
+    ForwardSource forward_A = ForwardSource::FROM_MEMORY;
+    ForwardSource forward_B = ForwardSource::FROM_MEMORY;
+
 };

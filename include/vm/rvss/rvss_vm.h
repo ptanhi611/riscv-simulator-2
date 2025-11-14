@@ -11,6 +11,7 @@
 
 #include "rvss_control_unit.h"
 #include "pipelining_register.h"
+#include "vm/hazard_detection_unit.h"
 
 #include <stack>
 #include <vector>
@@ -118,8 +119,12 @@ class RVSSVM : public VmBase {
     bool pipeline_stalled_;
     bool running_;
 
+    unsigned int stall_count ;
+
 
   public:
+
+    HazardDetectionUnit HDU;
     RVSSControlUnit control_unit_;
     std::atomic<bool> stop_requested_ = false;
 
