@@ -13,10 +13,19 @@
 #include "pipelining_register.h"
 #include "vm/hazard_detection_unit.h"
 
+#include "vm/branch_comparator_alu.h"
+
+#include "vm/branch_prediction_unit.h"
+
 #include <stack>
 #include <vector>
 #include <iostream>
 #include <cstdint>
+
+// #include <mutex>
+// #include <condition_variable>
+// #include <queue>
+// #include <atomic>
 
 // TODO: use a circular buffer instead of a stack for undo/redo
 
@@ -116,16 +125,30 @@ class RVSSVM : public VmBase {
     MEM_WB_registers mem_wb_reg;
 
     MODES pipeline_mode;
+
+
+
+    IF_ID_registers if_id_registers_next;
+    ID_EX_registers id_ex_reg_next;
+    EX_MEM_registers ex_mem_next;
+    MEM_WB_registers mem_wb_reg_next;
+
+
     bool pipeline_stalled_;
+   
     bool running_;
 
     unsigned int stall_count ;
 
 
-  public:
+  
 
     HazardDetectionUnit HDU;
     RVSSControlUnit control_unit_;
+    Branch_Comparision branch_alu;
+    BranchPredictionUnit bpu_;
+
+  public:
     std::atomic<bool> stop_requested_ = false;
 
 
@@ -143,6 +166,9 @@ class RVSSVM : public VmBase {
     uint64_t return_address_{};
 
     bool branch_flag_ = false;
+    bool flush_fetch_ = false;
+
+    bool branch_taken  = false;
     int64_t next_pc_{}; // for jal, jalr,
 
     // CSR intermediate variables

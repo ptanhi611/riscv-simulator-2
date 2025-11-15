@@ -4,6 +4,8 @@
 
 struct Control_signals{
     uint8_t alu_op = 0;
+    
+    
     bool alu_src_ = false;
 
     bool mem_read_ = false;
@@ -33,12 +35,18 @@ struct IF_ID_registers{
     
     bool valid = false;
 
+    bool predicted_as_taken = false;
+
     
 };
 
 
 
 struct ID_EX_registers{
+
+    uint64_t alu_ans = 0;
+
+    uint64_t pc = 0;
     uint64_t pc_plus_4 = 0;
 
     uint64_t rs1_data = 0;
@@ -56,8 +64,8 @@ struct ID_EX_registers{
 
     Control_signals signals;
 
-    uint8_t funct3;
-    uint8_t funct7;
+    uint8_t funct3 = 0;
+    uint8_t funct7 = 0;
 
 
     ForwardSource forward_A = ForwardSource::FROM_DECODE;
@@ -77,12 +85,9 @@ struct EX_MEM_registers{
 
     Control_signals signals;
 
-    uint8_t funct3;
+    uint8_t funct3 = 0;
 
-    ForwardSource forward_A = ForwardSource::FROM_EXECUTE;
-    ForwardSource forward_B = ForwardSource::FROM_EXECUTE;
 
-    
 
 };
 
@@ -101,7 +106,5 @@ struct MEM_WB_registers{
     Control_signals signals;
 
 
-    ForwardSource forward_A = ForwardSource::FROM_MEMORY;
-    ForwardSource forward_B = ForwardSource::FROM_MEMORY;
 
 };
